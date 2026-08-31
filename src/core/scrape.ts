@@ -156,10 +156,10 @@ async function scrapeWithBrowser(
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     });
     const page = await ctx.newPage();
-    const timeout = opts.waitUntilMs ?? 5000;
+    const timeout = opts.waitUntilMs ?? 8000;
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: timeout + 10000 });
-    // Give JS a moment to render.
-    await page.waitForTimeout(Math.min(timeout, 3000));
+    // Give JS (and any bot-challenge) time to render.
+    await page.waitForTimeout(timeout);
     const html = await page.content();
     const finalUrl = page.url();
     const data = extractPage(html, finalUrl);

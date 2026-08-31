@@ -173,9 +173,14 @@ async function main() {
   if (cmd === "scrape" || cmd === "json") {
     const url = positional[0];
     if (!url) throw new WebkitError(`Usage: webkit ${cmd} <url>`);
+    const waitMs =
+      typeof flags.get("wait") === "string"
+        ? Number(flags.get("wait"))
+        : undefined;
     const page = await scrape(url, {
       mode: (flags.get("mode") as "fast" | "browser" | undefined) || "fast",
       strict: true,
+      waitUntilMs: waitMs,
     });
     if (cmd === "json") {
       console.log(JSON.stringify(page, null, 2));
