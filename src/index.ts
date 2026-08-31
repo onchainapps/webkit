@@ -39,6 +39,11 @@ export {
 } from "./extract/content.ts";
 
 export {
+  extractPrice,
+  type PriceInfo,
+} from "./extract/price.ts";
+
+export {
   fetchText,
   WebkitError,
   DEFAULT_USER_AGENT,

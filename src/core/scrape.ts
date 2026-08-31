@@ -1,24 +1,30 @@
 /**
  * Scraper: fetch a URL and return structured page data.
  *
- * Two modes:
- *   - "fast" (default): plain HTTP fetch + DOMParser extraction.
+ * Three modes:
+ *   - "fast" (default): plain HTTP fetch + DOM extraction.
  *     Works for ~90% of static sites. No browser needed.
  *   - "browser": Playwright headless Chromium for JS-rendered pages.
- *     Falls back to fast mode if Playwright isn't installed.
+ *     Detects bot challenges (Cloudflare "Just a moment…") and reports them.
+ *   - "auto": try fast first; if it 4xx/5xx or times out, fall back to
+ *     browser. Best default when a site's bot posture is unknown.
+ *
+ * Browser mode falls back to fast mode if Playwright isn't installed.
  */
 
 import { fetchText, WebkitError } from "../core/http.ts";
 import { extractPage, type PageData } from "../extract/content.ts";
+import { extractPrice, type PriceInfo } from "../extract/price.ts";
+import { parseHtml } from "../core/dom.ts";
 
-export type ScrapeMode = "fast" | "browser";
+export type ScrapeMode = "fast" | "browser" | "auto";
 
 export interface ScrapeOptions {
-  /** "fast" (default) or "browser" (Playwright). */
+  /** "fast" (default), "browser" (Playwright), or "auto" (fast→browser). */
   mode?: ScrapeMode;
-  /** Wait for network idle in browser mode (ms). Default 5000. */
+  /** Wait in browser mode for JS / bot-challenges to settle (ms). Default 8000. */
   waitUntilMs?: number;
-  /** Extra headers. */
+  /** Extra headers (fast mode only). */
   headers?: Record<string, string>;
   /** User-agent override. */
   userAgent?: string;
@@ -26,49 +32,105 @@ export interface ScrapeOptions {
   signal?: AbortSignal;
   /** On 4xx/5xx: throw (default) or return partial data with the status. */
   strict?: boolean;
+  /** Extract a price (JSON-LD / microdata / class). Default true. */
+  price?: boolean;
 }
 
 export interface ScrapeResult extends PageData {
   mode: ScrapeMode;
+  /** The mode that actually produced this data. */
+  effectiveMode: "fast" | "browser";
   durationMs: number;
   retries: number;
+  /** True when we believe a bot/challenge wall is blocking real content. */
+  blocked: boolean;
+  /** The bot-challenge message, if `blocked`. */
+  challenge: string | null;
+  /** Structured price, if found (absent when blocked or no price present). */
+  price?: PriceInfo;
+  /** Set when Playwright was missing and we silently used fast instead. */
+  fellBackToFast?: boolean;
 }
 
 export async function scrape(url: string, opts: ScrapeOptions = {}): Promise<ScrapeResult> {
   const {
     mode = "fast",
-    waitUntilMs = 5000,
+    waitUntilMs = 8000,
     headers = {},
     userAgent,
     signal,
     strict = true,
+    price = true,
   } = opts;
 
-  const started = Date.now();
   const target = normalizeUrl(url);
 
   if (mode === "browser") {
+    return scrapeWithBrowser(target, { waitUntilMs, userAgent, signal, strict, price });
+  }
+
+  const playwrightReady = await hasPlaywright();
+
+  if (mode === "auto") {
+    // Try fast; if the site 4xx/5xx'd or timed out, escalate to the browser.
     try {
-      return await scrapeWithBrowser(target, { waitUntilMs, userAgent, signal });
-    } catch (err) {
-      if (isPlaywrightMissing(err)) {
-        // Fall through to fast mode with a note on stderr.
-        process.stderr.write(
-          "[webkit] Playwright not available, falling back to fast mode. " +
-            "Install with: bun add playwright && bunx playwright install chromium\n",
-        );
-      } else if (strict) {
-        throw err;
+      const fast = await scrapeFast(target, { headers, userAgent, signal, strict: false, price });
+      const fastFailed = fast.status >= 400 || fast.blocked;
+      if (fastFailed && playwrightReady) {
+        try {
+          return await scrapeWithBrowser(target, {
+            waitUntilMs,
+            userAgent,
+            signal,
+            strict,
+            price,
+          });
+        } catch {
+          return fast; // browser also failed — return the fast attempt
+        }
       }
+      if (strict && fast.status >= 400) throw new WebkitError(`HTTP ${fast.status} for ${url}`);
+      return fast;
+    } catch (err) {
+      // Fast threw (e.g. network timeout) — try the browser before giving up.
+      if (err instanceof WebkitError && playwrightReady) {
+        try {
+          return await scrapeWithBrowser(target, {
+            waitUntilMs,
+            userAgent,
+            signal,
+            strict,
+            price,
+          });
+        } catch (browserErr) {
+          throw strict ? browserErr : err;
+        }
+      }
+      throw err;
     }
   }
 
-  return scrapeFast(target, { headers, userAgent, signal, strict });
+  // Plain fast mode.
+  return scrapeFast(target, { headers, userAgent, signal, strict, price });
 }
 
 function normalizeUrl(url: string): string {
   if (/^https?:\/\//i.test(url)) return url;
   return `https://${url}`;
+}
+
+/** Cheap Playwright-availability probe (cached) so `auto` doesn't double-import. */
+let playwrightAvailable: boolean | null = null;
+async function hasPlaywright(): Promise<boolean> {
+  if (playwrightAvailable === null) {
+    try {
+      await import("playwright");
+      playwrightAvailable = true;
+    } catch {
+      playwrightAvailable = false;
+    }
+  }
+  return playwrightAvailable;
 }
 
 async function scrapeFast(
@@ -78,6 +140,7 @@ async function scrapeFast(
     userAgent?: string;
     signal?: AbortSignal;
     strict?: boolean;
+    price?: boolean;
   },
 ): Promise<ScrapeResult> {
   const started = Date.now();
@@ -87,10 +150,6 @@ async function scrapeFast(
     signal: opts.signal,
   });
 
-  if (opts.strict !== false && res.status >= 400) {
-    throw new WebkitError(`HTTP ${res.status} for ${url}`);
-  }
-
   const elapsed = Date.now() - started;
   const contentType = res.contentType.toLowerCase();
   const isHtml =
@@ -98,15 +157,27 @@ async function scrapeFast(
     contentType === "" ||
     res.text.trimStart().startsWith("<");
 
+  // Bot-block heuristic (fast mode): a 4xx/5xx status with a tiny body is
+  // almost always a bot wall / error page, not real content.
+  const blocked = res.status >= 400 && res.text.length < 5000;
+
+  // Strict mode throws on any 4xx/5xx (callers can pass strict:false to get
+  // partial data back instead).
+  if (opts.strict !== false && res.status >= 400) {
+    throw new WebkitError(`HTTP ${res.status} for ${url}`);
+  }
+
   if (!isHtml) {
-    // Non-HTML: return raw body as content.text, no metadata.
     return {
       url: res.url,
       status: res.status,
       contentType: res.contentType,
       mode: "fast",
+      effectiveMode: "fast",
       durationMs: elapsed,
       retries: res.retries,
+      blocked,
+      challenge: null,
       metadata: {
         title: "",
         description: null,
@@ -131,20 +202,34 @@ async function scrapeFast(
   }
 
   const page = extractPage(res.text, res.url);
-  return {
+  const out: ScrapeResult = {
     ...page,
     url: res.url,
     status: res.status,
     contentType: res.contentType,
     mode: "fast",
+    effectiveMode: "fast",
     durationMs: Date.now() - started,
     retries: res.retries,
+    blocked,
+    challenge: null,
   };
+  if (opts.price && !blocked) {
+    const p = extractPrice(parseHtml(res.text));
+    if (p) out.price = p;
+  }
+  return out;
 }
 
 async function scrapeWithBrowser(
   url: string,
-  opts: { waitUntilMs?: number; userAgent?: string; signal?: AbortSignal },
+  opts: {
+    waitUntilMs?: number;
+    userAgent?: string;
+    signal?: AbortSignal;
+    strict?: boolean;
+    price?: boolean;
+  },
 ): Promise<ScrapeResult> {
   const { chromium } = await import("playwright");
   const started = Date.now();
@@ -156,29 +241,61 @@ async function scrapeWithBrowser(
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     });
     const page = await ctx.newPage();
-    const timeout = opts.waitUntilMs ?? 8000;
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: timeout + 10000 });
+    const waitMs = opts.waitUntilMs ?? 8000;
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: waitMs + 15000 });
     // Give JS (and any bot-challenge) time to render.
-    await page.waitForTimeout(timeout);
+    await page.waitForTimeout(waitMs);
     const html = await page.content();
     const finalUrl = page.url();
+
+    // Detect a bot-challenge wall before we trust the DOM.
+    const challenge = detectChallenge(html);
+    const blocked = challenge !== null;
+
     const data = extractPage(html, finalUrl);
-    return {
+    const out: ScrapeResult = {
       ...data,
       url: finalUrl,
       mode: "browser",
+      effectiveMode: "browser",
       durationMs: Date.now() - started,
       retries: 0,
+      blocked,
+      challenge,
     };
+    // Don't report a price from a challenge page — the DOM is the wall, not the product.
+    if (opts.price && !blocked) {
+      const p = extractPrice(parseHtml(html));
+      if (p) out.price = p;
+    }
+    return out;
   } finally {
     await browser.close();
   }
 }
 
-function isPlaywrightMissing(err: unknown): boolean {
-  return (
-    err instanceof Error &&
-    (/Cannot find module|playwright/i.test(err.message) ||
-      (err as { code?: string }).code === "ERR_MODULE_NOT_FOUND")
-  );
+/**
+ * Detect a bot-challenge wall in rendered HTML. Returns a short human reason,
+ * or null when the page looks like real content.
+ */
+function detectChallenge(html: string): string | null {
+  const lower = html.slice(0, 40000).toLowerCase();
+  const titleMatch = html.match(/<title[^>]*>([^<]*)<\/title>/i);
+  const title = (titleMatch?.[1] || "").trim();
+  if (/just a moment/i.test(title)) return `Cloudflare challenge: "${title}"`;
+  if (/please enable js|enable javascript to continue/i.test(lower)) {
+    return "JavaScript-required gate (e.g. Incapsula/PerimeterX)";
+  }
+  if (/checking your browser|verify you are human|checking if your browser is ok/i.test(lower)) {
+    return "Browser-verification interstitial";
+  }
+  // Cloudflare turnstile / challenge-platform script with no cf_clearance.
+  if ((lower.includes("cf-challenge") || lower.includes("challenge-platform")) &&
+      !lower.includes("cf_clearance")) {
+    // Only flag if the body is also tiny — some sites load the platform script
+    // as part of a normal page.
+    const bodyText = html.replace(/<[^>]*>/g, " ").trim();
+    if (bodyText.length < 600) return "Cloudflare challenge platform (no clearance cookie)";
+  }
+  return null;
 }

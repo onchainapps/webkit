@@ -92,7 +92,12 @@ function printScrape(
   console.log(`URL: ${page.url}`);
   if (page.metadata.description) console.log(`Description: ${page.metadata.description}`);
   if (page.metadata.canonical) console.log(`Canonical: ${page.metadata.canonical}`);
-  console.log(`Mode: ${page.mode} · ${page.status} · ${page.durationMs}ms${page.retries ? ` · ${page.retries} retries` : ""}`);
+  console.log(`Mode: ${page.mode} (ran as ${page.effectiveMode}) · ${page.status} · ${page.durationMs}ms${page.retries ? ` · ${page.retries} retries` : ""}`);
+  if (page.blocked) console.log(`⚠ Blocked: ${page.challenge || "bot wall / error page"}`);
+  if (page.price) {
+    const was = page.price.wasPrice ? ` (was $${page.price.wasPrice.toFixed(2)})` : "";
+    console.log(`💰 Price: $${page.price.amount.toFixed(2)}${was} [${page.price.source}]${page.price.availability ? ` · ${page.price.availability}` : ""}`);
+  }
   console.log(`Links: ${page.links.length} (${page.links.filter((l) => l.external).length} external) · Images: ${page.images.length}`);
   console.log(`Content: ${page.content.charCount} chars · ~${Math.ceil(page.content.readingTimeSec / 60)} min read`);
   console.log();
@@ -142,7 +147,7 @@ async function main() {
     const results = await top(query, {
       count: scrapeCount,
       scrapeCount,
-      mode: (flags.get("mode") as "fast" | "browser" | undefined) || "fast",
+      mode: (flags.get("mode") as "fast" | "browser" | "auto" | undefined) || "fast",
     });
     if (json) {
       console.log(JSON.stringify(results, null, 2));
@@ -178,9 +183,10 @@ async function main() {
         ? Number(flags.get("wait"))
         : undefined;
     const page = await scrape(url, {
-      mode: (flags.get("mode") as "fast" | "browser" | undefined) || "fast",
+      mode: (flags.get("mode") as "fast" | "browser" | "auto" | undefined) || "fast",
       strict: true,
       waitUntilMs: waitMs,
+      price: !flags.has("no-price"),
     });
     if (cmd === "json") {
       console.log(JSON.stringify(page, null, 2));
@@ -211,16 +217,21 @@ Usage:
       Search + scrape the top N results in one command.
 
   webkit scrape <url> [options]
-          --mode <m>      fast (default) | browser (Playwright)
+          --mode <m>      fast (default) | browser (Playwright) | auto
+                          auto: try fast, fall back to browser on 4xx/timeout
+          --wait <ms>     browser settle time for JS/bot-challenges (default 8000)
+          --no-price      skip price extraction
           --meta          include metadata in JSON mode
           --links         include links in JSON mode
           --images        include images in JSON mode
           --text          include main content in JSON mode
           --chars <n>     max chars of main text to print (default 2000)
           --json          JSON output
+      Output includes: title, URL, price (if found), a "Blocked" note when a
+      bot wall is detected, links/images counts, and the main content.
 
-  webkit json <url> [--mode fast|browser]
-      Full structured dump (metadata + links + images + content).
+  webkit json <url> [--mode fast|browser|auto]
+      Full structured dump (metadata + links + images + content + price).
 
 Examples:
   webkit search "cardano utxo model" -c 5

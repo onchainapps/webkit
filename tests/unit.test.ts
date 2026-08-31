@@ -12,6 +12,7 @@ import {
   extractImages,
   extractMainContent,
 } from "../src/extract/content.ts";
+import { extractPrice } from "../src/extract/price.ts";
 import { parseHtml } from "../src/core/dom.ts";
 
 // search.ts keeps its parsers private, so we test them indirectly via a
@@ -42,9 +43,8 @@ describe("extractPage (article fixture)", () => {
   test("parses og: and twitter: tags", () => {
     const page = extractPage(articleHtml, "https://example.com/canonical/path");
     expect(page.metadata.og["og:title"]).toBe("OG Title");
-    // og:image is kept as-authored (relative) — absolutization is a
-    // downstream concern; we only absolutize link/img/canonical/favicon.
-    expect(page.metadata.og["og:image"]).toBe("/img/og.png");
+    // og:image is absolutized against the base URL so it's directly fetchable.
+    expect(page.metadata.og["og:image"]).toBe("https://example.com/img/og.png");
     expect(page.metadata.twitter["twitter:card"]).toBe("summary_large_image");
   });
 
@@ -144,5 +144,109 @@ describe("http layer", () => {
     const { DEFAULT_USER_AGENT } = await import("../src/core/http.ts");
     expect(DEFAULT_USER_AGENT).toContain("Mozilla/5.0");
     expect(DEFAULT_USER_AGENT).toContain("Chrome");
+  });
+});
+
+describe("extractPrice", () => {
+  test("reads JSON-LD Product offers.price", () => {
+    const html = `<!doctype html><html><head><script type="application/ld+json">
+      {"@type":"Product","name":"X","offers":{"@type":"Offer","price":"1649.00","priceCurrency":"USD","availability":"https://schema.org/InStock"}}
+      </script></head><body><p>hi</p></body></html>`;
+    const p = extractPrice(parseHtml(html));
+    expect(p?.amount).toBe(1649);
+    expect(p?.currency).toBe("USD");
+    expect(p?.source).toBe("json-ld");
+  });
+
+  test("handles @graph and array offers", () => {
+    const html = `<!doctype html><html><head><script type="application/ld+json">
+      {"@graph":[{"@type":"Product","offers":[{"@type":"Offer","price":99.5,"priceCurrency":"USD"}]}]}
+      </script></head><body></body></html>`;
+    const p = extractPrice(parseHtml(html));
+    expect(p?.amount).toBe(99.5);
+  });
+
+  test("falls back to a class-based price element", () => {
+    const html = `<!doctype html><html><body>
+      <div class="price-current">$1,609.99</div>
+      <p>product</p>
+    </body></html>`;
+    const p = extractPrice(parseHtml(html));
+    expect(p?.amount).toBe(1609.99);
+    expect(p?.source).toBe("class");
+  });
+
+  test("reads itemprop=price microdata", () => {
+    const html = `<!doctype html><html><body>
+      <div itemscope itemtype="https://schema.org/Product">
+        <span itemprop="price" content="249.99">$249.99</span>
+      </div></body></html>`;
+    const p = extractPrice(parseHtml(html));
+    expect(p?.amount).toBe(249.99);
+    expect(p?.source).toBe("microdata");
+  });
+
+  test("returns null when no price present", () => {
+    const p = extractPrice(parseHtml("<html><body><p>no price here</p></body></html>"));
+    expect(p).toBeNull();
+  });
+});
+
+describe("detectChallenge (via scrape fast mode blocked heuristic)", () => {
+  // detectChallenge is exercised end-to-end in integration; here we unit-test
+  // the fast-mode `blocked` flag through a mocked fetch.
+  test("fast mode flags a tiny 403 body as blocked", async () => {
+    const { scrape } = await import("../src/core/scrape.ts");
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response("<html><body>403 Forbidden</body></html>", {
+        status: 403,
+        headers: { "content-type": "text/html" },
+      })) as unknown as typeof fetch;
+    try {
+      const r = await scrape("https://example.com", { strict: false, mode: "fast" });
+      expect(r.status).toBe(403);
+      expect(r.blocked).toBe(true);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("fast mode does not flag a 200 page as blocked", async () => {
+    const { scrape } = await import("../src/core/scrape.ts");
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response("<html><body><p>real content</p></body></html>", {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      })) as unknown as typeof fetch;
+    try {
+      const r = await scrape("https://example.com", { mode: "fast" });
+      expect(r.blocked).toBe(false);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+});
+
+describe("extractPrice (was/now handling)", () => {
+  test("takes the current price, not the struck-through 'was' price", () => {
+    // Mimics Newegg: a product-price block shows the old price then the current.
+    const html = `<!doctype html><html><body>
+      <div class="product-price">$1,549.00$1,609.99Click to See Extra Discount</div>
+    </body></html>`;
+    const p = extractPrice(parseHtml(html));
+    expect(p?.amount).toBe(1609.99); // current, not 1549
+    expect(p?.wasPrice).toBe(1549.0);
+    expect(p?.source).toBe("class");
+  });
+
+  test("product-price wins over seller-listing price-current", () => {
+    const html = `<!doctype html><html><body>
+      <li class="price-current">$1,729.35</li>
+      <div class="product-price">$1,609.99</div>
+    </body></html>`;
+    const p = extractPrice(parseHtml(html));
+    expect(p?.amount).toBe(1609.99);
   });
 });

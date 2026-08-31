@@ -103,6 +103,17 @@ export function extractMetadata(doc: HDocument, baseUrl: string): PageMetadata {
     else if (rel.includes("icon")) favicon = abs(baseUrl, href);
   }
 
+  // Absolutize og: and twitter: URLs (og:image, og:url, twitter:image) so
+  // relative refs like "/img/og.png" become fetchable absolute URLs.
+  for (const key of Object.keys(og)) {
+    const val = og[key];
+    if (val && /(image|url|video|icon|logo)$/i.test(key)) og[key] = abs(baseUrl, val) ?? val;
+  }
+  for (const key of Object.keys(twitter)) {
+    const val = twitter[key];
+    if (val && /(image|url|video|logo)$/i.test(key)) twitter[key] = abs(baseUrl, val) ?? val;
+  }
+
   const htmlEl = doc.querySelector("html");
   language = htmlEl?.getAttribute("lang") || null;
   const metaCharset = doc.querySelector('meta[charset]');
