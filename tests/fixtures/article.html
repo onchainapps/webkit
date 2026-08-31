@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Test Article &amp; Page</title>
+  <meta name="description" content="A test page for webkit extraction.">
+  <meta property="og:title" content="OG Title">
+  <meta property="og:description" content="OG description here">
+  <meta property="og:image" content="/img/og.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="canonical" href="https://example.com/canonical/path">
+  <link rel="icon" href="/favicon.ico">
+</head>
+<body>
+  <header><nav><a href="/">Home</a><a href="/about">About</a></nav></header>
+  <article class="post-content">
+    <h1>The Real Headline</h1>
+    <p>This is the first paragraph of the main content. It has enough words to be scored
+       as a meaningful block by the extractor. Cardano uses the extended UTXO model.</p>
+    <p>Second paragraph with more body text. This talks about redeemers, datums, and
+       script context in Plutus contracts so the extractor has density to work with.</p>
+    <p>Third paragraph. The point of eUTXO is that state is derived from an immutable log
+       of unspent outputs rather than mutated account balances like in Ethereum.</p>
+    <p>Fourth paragraph to make the article clearly the dominant content region on
+       this page, beating out the navigation and footer noise that surrounds it.</p>
+  </article>
+  <footer>
+    <p>Footer text that should be excluded by the extractor. Some legal boilerplate
+       and copyright notices live down here at the very bottom of the page body.</p>
+    <a href="https://external.example.com/external">External Link</a>
+    <a href="/internal/page">Internal Link</a>
+  </footer>
+  <img src="/img/photo.jpg" alt="A photo" width="800" height="600">
+  <img src="https://cdn.example.com/remote.png" alt="Remote image">
+</body>
+</html>
