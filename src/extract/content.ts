@@ -10,7 +10,7 @@
  */
 
 import type { Document as HDocument, Element as HElement } from "happy-dom";
-import { parseHtml } from "../core/dom.ts";
+import { withDoc } from "../core/dom.ts";
 
 export interface PageMetadata {
   title: string;
@@ -321,10 +321,11 @@ export function extractMainContent(doc: HDocument, baseUrl: string): ExtractedCo
 }
 
 /**
- * Full extraction: metadata + links + images + main content.
+ * Full extraction from an already-parsed document: metadata + links + images +
+ * main content. NOTE: `extractMainContent` strips noise nodes from `doc`, so
+ * run any other extraction (e.g. price) *before* calling this.
  */
-export function extractPage(html: string, url: string): PageData {
-  const doc = parseHtml(html);
+export function extractPageFromDoc(doc: HDocument, url: string): PageData {
   return {
     url,
     status: 200,
@@ -334,4 +335,11 @@ export function extractPage(html: string, url: string): PageData {
     images: extractImages(doc, url),
     content: extractMainContent(doc, url),
   };
+}
+
+/**
+ * Full extraction from an HTML string.
+ */
+export function extractPage(html: string, url: string): PageData {
+  return withDoc(html, (doc) => extractPageFromDoc(doc, url));
 }

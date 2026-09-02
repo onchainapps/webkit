@@ -14,6 +14,8 @@ import { scrape, type ScrapeResult, type ScrapeMode } from "./core/scrape.ts";
 
 export {
   search,
+  resolveEngine,
+  type SearchEngine,
   type SearchResult,
   type SearchOptions,
 } from "./core/search.ts";
@@ -27,6 +29,7 @@ export {
 
 export {
   extractPage,
+  extractPageFromDoc,
   extractMetadata,
   extractLinks,
   extractImages,
@@ -42,6 +45,8 @@ export {
   extractPrice,
   type PriceInfo,
 } from "./extract/price.ts";
+
+export { withDoc, parseHtml, disposeDoc } from "./core/dom.ts";
 
 export {
   fetchText,

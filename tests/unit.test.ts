@@ -250,3 +250,113 @@ describe("extractPrice (was/now handling)", () => {
     expect(p?.amount).toBe(1609.99);
   });
 });
+
+describe("search engine routing", () => {
+  test("resolveEngine accepts the ddg alias and rejects junk", async () => {
+    const { resolveEngine } = await import("../src/core/search.ts");
+    expect(resolveEngine("ddg")).toBe("duckduckgo");
+    expect(resolveEngine("DuckDuckGo")).toBe("duckduckgo");
+    expect(resolveEngine("bing")).toBe("bing");
+    expect(() => resolveEngine("google")).toThrow(/Unknown search engine/);
+  });
+
+  test("engine: 'ddg' hits DuckDuckGo, not Bing", async () => {
+    const { search } = await import("../src/core/search.ts");
+    const hits: string[] = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      hits.push(String(input instanceof Request ? input.url : input));
+      return new Response(ddgHtml, { status: 200, headers: { "content-type": "text/html" } });
+    }) as unknown as typeof fetch;
+    try {
+      const results = await search("q", { engine: "ddg", count: 2 });
+      expect(hits).toHaveLength(1);
+      expect(hits[0]).toContain("html.duckduckgo.com");
+      expect(hits[0]).toContain("kp=-1");
+      expect(results[0]?.url).toBe("https://example.com/page1");
+      expect(results[0]?.engine).toBe("duckduckgo");
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+});
+
+describe("detectChallenge", () => {
+  test("flags a Cloudflare interstitial served with HTTP 200 in fast mode", async () => {
+    const { scrape } = await import("../src/core/scrape.ts");
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(
+        `<html><head><title>Just a moment...</title></head><body><p>Checking your browser before accessing the site.</p></body></html>`,
+        { status: 200, headers: { "content-type": "text/html" } },
+      )) as unknown as typeof fetch;
+    try {
+      const r = await scrape("https://example.com", { mode: "fast" });
+      expect(r.status).toBe(200);
+      expect(r.blocked).toBe(true);
+      expect(r.challenge).toMatch(/Cloudflare/);
+      expect(r.price).toBeUndefined();
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+});
+
+describe("dom pool", () => {
+  test("withDoc reuses Windows instead of leaking one per parse", async () => {
+    const { withDoc } = await import("../src/core/dom.ts");
+    const seen = new Set<unknown>();
+    for (let i = 0; i < 20; i++) {
+      withDoc(`<html><body><p>${i}</p></body></html>`, (doc) => {
+        seen.add(doc.defaultView);
+        expect(doc.querySelector("p")?.textContent).toBe(String(i));
+      });
+    }
+    // Sequential use should reuse a single pooled Window.
+    expect(seen.size).toBe(1);
+  });
+
+  test("scripts in parsed HTML do not execute", async () => {
+    const { withDoc } = await import("../src/core/dom.ts");
+    (globalThis as Record<string, unknown>).__webkitPwned = false;
+    withDoc(
+      `<html><head><script>globalThis.__webkitPwned = true</script></head><body><p>x</p></body></html>`,
+      (doc) => {
+        expect((doc.defaultView as unknown as Record<string, unknown>).__webkitPwned).toBeUndefined();
+      },
+    );
+    expect((globalThis as Record<string, unknown>).__webkitPwned).toBe(false);
+  });
+});
+
+describe("fetchText", () => {
+  test("retries 429 with backoff and honors Retry-After", async () => {
+    const { fetchText } = await import("../src/core/http.ts");
+    let calls = 0;
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      calls++;
+      if (calls === 1) {
+        return new Response("slow down", { status: 429, headers: { "retry-after": "0" } });
+      }
+      return new Response("<p>ok</p>", { status: 200, headers: { "content-type": "text/html" } });
+    }) as unknown as typeof fetch;
+    try {
+      const r = await fetchText("https://example.com", { maxAttempts: 3 });
+      expect(calls).toBe(2);
+      expect(r.status).toBe(200);
+      expect(r.retries).toBe(1);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("does not retry when the caller aborts", async () => {
+    const { fetchText } = await import("../src/core/http.ts");
+    const ac = new AbortController();
+    ac.abort(new Error("caller cancelled"));
+    await expect(fetchText("https://example.com", { signal: ac.signal })).rejects.toThrow(
+      /caller cancelled/,
+    );
+  });
+});

@@ -12,7 +12,7 @@
         "typescript": "^7.0.2",
       },
       "optionalDependencies": {
-        "playwright": "latest",
+        "playwright": "^1.62.0",
       },
     },
   },

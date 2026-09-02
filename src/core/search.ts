@@ -9,7 +9,9 @@
  */
 
 import { fetchText, WebkitError } from "./http.ts";
-import { parseHtml } from "./dom.ts";
+import { withDoc } from "./dom.ts";
+
+export type SearchEngine = "duckduckgo" | "bing";
 
 export interface SearchResult {
   rank: number;
@@ -18,51 +20,69 @@ export interface SearchResult {
   /** Snippet as shown by the engine (may be empty). */
   snippet: string;
   /** Which engine produced this result. */
-  engine: "duckduckgo" | "bing";
+  engine: SearchEngine;
 }
 
 export interface SearchOptions {
   /** Number of results to return (default 10). */
   count?: number;
-  /** Force a specific engine instead of the DDG→Bing cascade. */
-  engine?: "duckduckgo" | "bing";
+  /** Force a specific engine instead of the DDG→Bing cascade. "ddg" is accepted as an alias. */
+  engine?: SearchEngine | "ddg";
   /** Safety filter: "strict" | "moderate" | "off" (default "moderate"). */
   safeSearch?: "strict" | "moderate" | "off";
   /** Abort signal. */
   signal?: AbortSignal;
 }
 
-function parseDuckDuckGo(html: string, count: number): SearchResult[] {
-  const doc = parseHtml(html);
-  const results: SearchResult[] = [];
+const ENGINE_ALIASES: Record<string, SearchEngine> = {
+  duckduckgo: "duckduckgo",
+  ddg: "duckduckgo",
+  bing: "bing",
+};
 
-  // DDG HTML lists results in <div class="result results_links ..."> containers
-  // each holding an <a class="result__a"> title and a snippet element.
-  const items = doc.querySelectorAll("div.result, div.web-result");
-
-  items.forEach((item) => {
-    if (results.length >= count) return;
-
-    const linkEl = item.querySelector("a.result__a, h2 a");
-    const snippetEl = item.querySelector(
-      "a.result__snippet, div.result__snippet, .result__snippet",
+/** Normalize a user-supplied engine name; throws on unknown values. */
+export function resolveEngine(name: string): SearchEngine {
+  const eng = ENGINE_ALIASES[name.trim().toLowerCase()];
+  if (!eng) {
+    throw new WebkitError(
+      `Unknown search engine "${name}" (expected one of: duckduckgo, ddg, bing)`,
     );
-    if (!linkEl) return;
+  }
+  return eng;
+}
 
-    const href = linkEl.getAttribute("href") ?? "";
-    const url = resolveDdgUrl(href);
-    if (!url) return;
+function parseDuckDuckGo(html: string, count: number): SearchResult[] {
+  return withDoc(html, (doc) => {
+    const results: SearchResult[] = [];
 
-    results.push({
-      rank: results.length + 1,
-      title: linkEl.textContent?.trim() ?? "",
-      url,
-      snippet: snippetEl?.textContent?.trim() ?? "",
-      engine: "duckduckgo",
+    // DDG HTML lists results in <div class="result results_links ..."> containers
+    // each holding an <a class="result__a"> title and a snippet element.
+    const items = doc.querySelectorAll("div.result, div.web-result");
+
+    items.forEach((item) => {
+      if (results.length >= count) return;
+
+      const linkEl = item.querySelector("a.result__a, h2 a");
+      const snippetEl = item.querySelector(
+        "a.result__snippet, div.result__snippet, .result__snippet",
+      );
+      if (!linkEl) return;
+
+      const href = linkEl.getAttribute("href") ?? "";
+      const url = resolveDdgUrl(href);
+      if (!url) return;
+
+      results.push({
+        rank: results.length + 1,
+        title: linkEl.textContent?.trim() ?? "",
+        url,
+        snippet: snippetEl?.textContent?.trim() ?? "",
+        engine: "duckduckgo",
+      });
     });
-  });
 
-  return results;
+    return results;
+  });
 }
 
 /**
@@ -86,33 +106,34 @@ function resolveDdgUrl(href: string): string | null {
 }
 
 function parseBing(html: string, count: number): SearchResult[] {
-  const doc = parseHtml(html);
-  const results: SearchResult[] = [];
+  return withDoc(html, (doc) => {
+    const results: SearchResult[] = [];
 
-  // Bing organic results: <li class="b_algo"> with <h2><a>
-  const items = doc.querySelectorAll("li.b_algo");
-  items.forEach((item) => {
-    if (results.length >= count) return;
+    // Bing organic results: <li class="b_algo"> with <h2><a>
+    const items = doc.querySelectorAll("li.b_algo");
+    items.forEach((item) => {
+      if (results.length >= count) return;
 
-    const linkEl = item.querySelector("h2 a");
-    const snippetEl = item.querySelector(
-      "p.b_lineclamp, .b_caption p, .b_lineclamp2, .b_lineclamp3, .b_lineclamp4, .b_lineclamp5, p",
-    );
-    if (!linkEl) return;
+      const linkEl = item.querySelector("h2 a");
+      const snippetEl = item.querySelector(
+        "p.b_lineclamp, .b_caption p, .b_lineclamp2, .b_lineclamp3, .b_lineclamp4, .b_lineclamp5, p",
+      );
+      if (!linkEl) return;
 
-    const href = linkEl.getAttribute("href") ?? "";
-    if (!href.startsWith("http")) return;
+      const href = linkEl.getAttribute("href") ?? "";
+      if (!href.startsWith("http")) return;
 
-    results.push({
-      rank: results.length + 1,
-      title: linkEl.textContent?.trim() ?? "",
-      url: href,
-      snippet: snippetEl?.textContent?.trim() ?? "",
-      engine: "bing",
+      results.push({
+        rank: results.length + 1,
+        title: linkEl.textContent?.trim() ?? "",
+        url: href,
+        snippet: snippetEl?.textContent?.trim() ?? "",
+        engine: "bing",
+      });
     });
-  });
 
-  return results;
+    return results;
+  });
 }
 
 /**
@@ -123,8 +144,8 @@ function parseBing(html: string, count: number): SearchResult[] {
 export async function search(query: string, opts: SearchOptions = {}): Promise<SearchResult[]> {
   const { count = 10, engine, safeSearch = "moderate", signal } = opts;
 
-  const engines: Array<"duckduckgo" | "bing"> = engine
-    ? [engine]
+  const engines: SearchEngine[] = engine
+    ? [resolveEngine(engine)]
     : ["duckduckgo", "bing"];
 
   let lastError: unknown = null;
@@ -132,17 +153,27 @@ export async function search(query: string, opts: SearchOptions = {}): Promise<S
   for (const eng of engines) {
     try {
       if (eng === "duckduckgo") {
-        const q = new URLSearchParams({ q: query, kl: "us-en" });
+        // kp: 1 = strict, -1 = moderate (default), -2 = off
+        const kp = safeSearch === "strict" ? "1" : safeSearch === "off" ? "-2" : "-1";
+        const q = new URLSearchParams({ q: query, kl: "us-en", kp });
         const res = await fetchText(`https://html.duckduckgo.com/html/?${q.toString()}`, {
           signal,
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
         });
+        if (res.status !== 200) {
+          // DDG answers automated-looking traffic with a 202 "anomaly" page.
+          const hint =
+            res.status === 202
+              ? " (bot check / rate limit — wait a while or use engine: \"bing\")"
+              : "";
+          lastError = new WebkitError(`DuckDuckGo returned HTTP ${res.status}${hint}`);
+          continue;
+        }
         const results = parseDuckDuckGo(res.text, count);
         if (results.length > 0) return results;
         lastError = new WebkitError("DuckDuckGo returned no parseable results");
       } else {
-        const q = new URLSearchParams({ q: query, setlang: "en" });
-        if (safeSearch === "strict") q.set("family", "1");
+        // adlt: strict | moderate | off
+        const q = new URLSearchParams({ q: query, setlang: "en", adlt: safeSearch });
         const res = await fetchText(`https://www.bing.com/search?${q.toString()}`, {
           signal,
         });

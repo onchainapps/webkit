@@ -37,7 +37,7 @@ export interface FetchResult {
   text: string;
   /** Final response content-type header. */
   contentType: string;
-  /** Whether the request was retried at least once. */
+  /** How many times the request was retried (0 = first attempt succeeded). */
   retries: number;
   /** Wall-clock duration of the whole operation (ms). */
   durationMs: number;
@@ -60,6 +60,17 @@ function defaultHeaders(userAgent: string): Record<string, string> {
   };
 }
 
+/** Parse a Retry-After header (seconds or HTTP-date) into a delay in ms, capped. */
+function retryAfterMs(res: Response, cap = 10_000): number | null {
+  const h = res.headers.get("retry-after");
+  if (!h) return null;
+  const secs = Number(h);
+  if (Number.isFinite(secs)) return Math.min(cap, Math.max(0, secs * 1000));
+  const at = Date.parse(h);
+  if (Number.isNaN(at)) return null;
+  return Math.min(cap, Math.max(0, at - Date.now()));
+}
+
 export async function fetchText(url: string, opts: FetchOptions = {}): Promise<FetchResult> {
   const {
     timeoutMs = 15000,
@@ -72,17 +83,16 @@ export async function fetchText(url: string, opts: FetchOptions = {}): Promise<F
   const allHeaders = { ...defaultHeaders(userAgent), ...headers };
   const started = Date.now();
   let attempt = 0;
-  let lastError: unknown;
 
   for (;;) {
     attempt += 1;
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    if (signal?.aborted) throw signal.reason ?? new WebkitError(`Request to ${url} aborted`);
+
     const controller = new AbortController();
-    // Chain an external abort into our timeout controller.
-    if (signal) {
-      if (signal.aborted) controller.abort(signal.reason);
-      else signal.addEventListener("abort", () => controller.abort(signal.reason), { once: true });
-    }
+    const timer = setTimeout(() => controller.abort(new Error("timeout")), timeoutMs);
+    // Chain an external abort into our per-attempt controller.
+    const onAbort = () => controller.abort(signal?.reason);
+    signal?.addEventListener("abort", onAbort, { once: true });
 
     try {
       const res = await fetch(url, {
@@ -90,12 +100,13 @@ export async function fetchText(url: string, opts: FetchOptions = {}): Promise<F
         redirect: "follow",
         signal: controller.signal,
       });
-      clearTimeout(timer);
 
       const retryable = res.status === 429 || res.status >= 500;
       if (retryable && attempt < maxAttempts) {
-        const delay = 750 * 2 ** (attempt - 1) + Math.floor(Math.random() * 250);
-        await sleep(delay);
+        // Drain the body so the connection can be reused, then back off.
+        await res.arrayBuffer().catch(() => {});
+        const backoff = 750 * 2 ** (attempt - 1) + Math.floor(Math.random() * 250);
+        await sleep(retryAfterMs(res) ?? backoff);
         continue;
       }
 
@@ -109,21 +120,22 @@ export async function fetchText(url: string, opts: FetchOptions = {}): Promise<F
         durationMs: Date.now() - started,
       };
     } catch (err) {
-      clearTimeout(timer);
-      lastError = err;
-      const isAbort = err instanceof Error && err.name === "AbortError";
       // Don't retry explicit aborts from the caller.
       if (signal?.aborted) throw err;
-      if (attempt < maxAttempts && !isAbort) {
-        const delay = 500 * 2 ** (attempt - 1);
-        await sleep(delay);
+      const isTimeout = controller.signal.aborted;
+      if (attempt < maxAttempts && !isTimeout) {
+        await sleep(500 * 2 ** (attempt - 1));
         continue;
       }
       throw new WebkitError(
         `Request to ${url} failed after ${attempt} attempt(s): ${
-          err instanceof Error ? err.message : String(err)
+          isTimeout ? `timed out after ${timeoutMs}ms` : err instanceof Error ? err.message : String(err)
         }`,
+        err,
       );
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
     }
   }
 }

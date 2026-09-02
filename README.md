@@ -17,12 +17,18 @@ Built to feed LLMs and agent pipelines with clean, structured web data.
 
 ## Install / run
 
+Requires [Bun](https://bun.sh) 1.x.
+
 ```bash
-cd /media/bakon/data/llms/webkit
-bun install            # already installed
-bun test               # 17 tests: unit (fixture) + live integration
+git clone <this-repo> webkit && cd webkit
+bun install            # happy-dom + (optional) playwright
+bun test               # unit (fixture-based) + live integration (auto-skips offline)
 bun run typecheck      # tsc --noEmit
 ```
+
+`browser` mode also needs a Chromium build: `bunx playwright install chromium`.
+Without it, browser mode transparently falls back to fast mode and sets
+`fellBackToFast: true` on the result.
 
 ### CLI
 
@@ -44,7 +50,9 @@ bun run src/cli/index.ts top "cardano eutxo" -n 3 --chars 300
 ### Library
 
 ```ts
-import { search, scrape, top } from "/media/bakon/data/llms/webkit/src/index.ts";
+// From a sibling project: import from the repo's src/index.ts, or add it as a
+// path dependency in package.json ("webkit": "file:../webkit") and import "webkit".
+import { search, scrape, top } from "webkit";
 
 // Search
 const results = await search("cardano utxo model", { count: 5 });
@@ -78,6 +86,7 @@ src/
     dom.ts           happy-dom Window pool (Bun-compatible HTML parse)
   extract/
     content.ts       metadata, links, images, Kadane-scored main-content extractor
+    price.ts         JSON-LD / microdata / class-based price extraction
   cli/
     index.ts         the `webkit` command
 tests/
@@ -95,8 +104,32 @@ tests/
 - **Bun test quirk:** `test.skipIf(cond)` is evaluated at *collection* time, before
   `beforeAll` — so live tests use runtime `if (!online) return;` guards instead.
 - **Bot protection:** some sites (e.g. cardanoscan.io) return 403 to our
-  non-browser UA. `scrape({ strict: false })` returns partial data; `strict: true`
-  (default) throws. Use `--mode browser` for JS-heavy/bot-gated pages.
+  non-browser UA. `scrape({ strict: false })` (CLI: `--lenient`) returns partial
+  data; `strict: true` (default) throws. Use `--mode browser` or `--mode auto`
+  for JS-heavy/bot-gated pages. Both modes set `blocked` / `challenge` when a
+  Cloudflare-style interstitial is detected instead of real content.
+- **DuckDuckGo 202:** after a burst of queries DDG serves a captcha page with
+  HTTP 202 instead of results. The cascade falls through to Bing automatically;
+  with `--engine ddg` forced you get a clear error instead. Back off for a while.
+- **Untrusted HTML:** pages are parsed with script evaluation and external
+  resource loading disabled (`core/dom.ts`). Scraped JavaScript never runs.
+- **Price extraction is USD-only** for now: it recognises `$` amounts and
+  JSON-LD/microdata `price` fields, and reports `currency` from JSON-LD when
+  declared (else `"USD"`). Locale formats like `1.609,99 €` are not parsed.
+
+### Responsible use
+
+`search` works by fetching DuckDuckGo's and Bing's HTML result pages with a
+browser-like User-Agent and parsing them. This is not an official API: it may
+break whenever their markup changes, and automated querying is against both
+engines' terms of service. `scrape` does not (yet) honor `robots.txt` or apply
+per-host rate limits beyond `top()`'s small concurrency cap. Use it for
+personal/research workloads at low volume, respect site owners, and don't point
+it at sites that prohibit scraping.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
 
 ## Roadmap (ideas)
 

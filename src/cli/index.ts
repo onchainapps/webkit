@@ -3,12 +3,13 @@
  * webkit CLI.
  *
  *   webkit search "cardano utxo" [--count N] [--engine ddg|bing] [--json]
- *   webkit scrape <url> [--mode fast|browser] [--json] [--meta] [--links] [--images] [--text]
- *   webkit json <url> [--mode fast|browser]   (full structured dump)
+ *   webkit top <query> [-n N] [--chars N] [--mode fast|browser|auto] [--json]
+ *   webkit scrape <url> [--mode fast|browser|auto] [--lenient] [--json] [--meta] [--links] [--images] [--text]
+ *   webkit json <url> [--mode fast|browser|auto]   (full structured dump)
  *   webkit help
  */
 
-import { search, scrape, top, WebkitError } from "../index.ts";
+import { search, scrape, top, resolveEngine, WebkitError } from "../index.ts";
 
 const args = process.argv.slice(2);
 const [cmd, ...rest] = args;
@@ -45,6 +46,18 @@ function parseFlags(
     }
   }
   return { flags, positional };
+}
+
+function parseMode(v: string | boolean | undefined): "fast" | "browser" | "auto" {
+  if (v === undefined || v === true) return "fast";
+  if (v === "fast" || v === "browser" || v === "auto") return v;
+  throw new WebkitError(`Unknown --mode "${v}" (expected fast|browser|auto)`);
+}
+
+function parseSafe(v: string | boolean | undefined): "strict" | "moderate" | "off" {
+  if (v === undefined || v === true) return "moderate";
+  if (v === "strict" || v === "moderate" || v === "off") return v;
+  throw new WebkitError(`Unknown --safe "${v}" (expected strict|moderate|off)`);
 }
 
 function printResults(results: Awaited<ReturnType<typeof search>>, json: boolean) {
@@ -125,8 +138,8 @@ async function main() {
           : typeof flags.get("c") === "string"
             ? Number(flags.get("c"))
             : 10,
-      engine: (flags.get("engine") as "duckduckgo" | "bing" | undefined) || undefined,
-      safeSearch: (flags.get("safe") as "strict" | "moderate" | "off" | undefined) || "moderate",
+      engine: typeof flags.get("engine") === "string" ? resolveEngine(String(flags.get("engine"))) : undefined,
+      safeSearch: parseSafe(flags.get("safe")),
     });
     printResults(results, flags.has("json"));
     return;
@@ -147,7 +160,7 @@ async function main() {
     const results = await top(query, {
       count: scrapeCount,
       scrapeCount,
-      mode: (flags.get("mode") as "fast" | "browser" | "auto" | undefined) || "fast",
+      mode: parseMode(flags.get("mode")),
     });
     if (json) {
       console.log(JSON.stringify(results, null, 2));
@@ -183,8 +196,8 @@ async function main() {
         ? Number(flags.get("wait"))
         : undefined;
     const page = await scrape(url, {
-      mode: (flags.get("mode") as "fast" | "browser" | "auto" | undefined) || "fast",
-      strict: true,
+      mode: parseMode(flags.get("mode")),
+      strict: !flags.has("lenient"),
       waitUntilMs: waitMs,
       price: !flags.has("no-price"),
     });
@@ -205,14 +218,15 @@ function helpText(): string {
 Usage:
   webkit search <query> [options]
       -c, --count <n>     number of results (default 10)
-          --engine <e>    force engine: duckduckgo|bing (default: ddg, fallback bing)
+          --engine <e>    force engine: duckduckgo (alias: ddg) | bing
+                          (default: try DuckDuckGo, fall back to Bing)
           --safe <s>      strict|moderate|off (default moderate)
           --json          JSON output
 
   webkit top <query> [options]
       -n, --count <n>   how many top results to scrape (default 3)
           --chars <n>   max chars of each page's content to print (default 400)
-          --mode <m>    fast (default) | browser
+          --mode <m>    fast (default) | browser | auto
           --json        JSON output
       Search + scrape the top N results in one command.
 
@@ -221,6 +235,7 @@ Usage:
                           auto: try fast, fall back to browser on 4xx/timeout
           --wait <ms>     browser settle time for JS/bot-challenges (default 8000)
           --no-price      skip price extraction
+          --lenient       return partial data on 4xx/5xx instead of erroring
           --meta          include metadata in JSON mode
           --links         include links in JSON mode
           --images        include images in JSON mode

@@ -6,16 +6,16 @@
  *     Works for ~90% of static sites. No browser needed.
  *   - "browser": Playwright headless Chromium for JS-rendered pages.
  *     Detects bot challenges (Cloudflare "Just a moment…") and reports them.
- *   - "auto": try fast first; if it 4xx/5xx or times out, fall back to
- *     browser. Best default when a site's bot posture is unknown.
+ *   - "auto": try fast first; if it 4xx/5xx, looks blocked, or times out,
+ *     fall back to browser. Best default when a site's bot posture is unknown.
  *
  * Browser mode falls back to fast mode if Playwright isn't installed.
  */
 
-import { fetchText, WebkitError } from "../core/http.ts";
-import { extractPage, type PageData } from "../extract/content.ts";
+import { fetchText, WebkitError, DEFAULT_USER_AGENT } from "../core/http.ts";
+import { extractPageFromDoc, type PageData } from "../extract/content.ts";
 import { extractPrice, type PriceInfo } from "../extract/price.ts";
-import { parseHtml } from "../core/dom.ts";
+import { withDoc } from "../core/dom.ts";
 
 export type ScrapeMode = "fast" | "browser" | "auto";
 
@@ -64,50 +64,47 @@ export async function scrape(url: string, opts: ScrapeOptions = {}): Promise<Scr
   } = opts;
 
   const target = normalizeUrl(url);
+  const browserOpts = { waitUntilMs, userAgent, signal, strict, price };
 
   if (mode === "browser") {
-    return scrapeWithBrowser(target, { waitUntilMs, userAgent, signal, strict, price });
+    if (!(await hasPlaywright())) {
+      const fast = await scrapeFast(target, { headers, userAgent, signal, strict, price });
+      return { ...fast, mode: "browser", fellBackToFast: true };
+    }
+    return scrapeWithBrowser(target, browserOpts);
   }
 
-  const playwrightReady = await hasPlaywright();
-
   if (mode === "auto") {
-    // Try fast; if the site 4xx/5xx'd or timed out, escalate to the browser.
+    const playwrightReady = await hasPlaywright();
+    // Try fast; if the site 4xx/5xx'd, looks blocked, or timed out, escalate.
+    let fast: ScrapeResult;
     try {
-      const fast = await scrapeFast(target, { headers, userAgent, signal, strict: false, price });
-      const fastFailed = fast.status >= 400 || fast.blocked;
-      if (fastFailed && playwrightReady) {
-        try {
-          return await scrapeWithBrowser(target, {
-            waitUntilMs,
-            userAgent,
-            signal,
-            strict,
-            price,
-          });
-        } catch {
-          return fast; // browser also failed — return the fast attempt
-        }
-      }
-      if (strict && fast.status >= 400) throw new WebkitError(`HTTP ${fast.status} for ${url}`);
-      return fast;
+      fast = await scrapeFast(target, { headers, userAgent, signal, strict: false, price });
     } catch (err) {
       // Fast threw (e.g. network timeout) — try the browser before giving up.
-      if (err instanceof WebkitError && playwrightReady) {
+      if (err instanceof WebkitError && playwrightReady && !signal?.aborted) {
         try {
-          return await scrapeWithBrowser(target, {
-            waitUntilMs,
-            userAgent,
-            signal,
-            strict,
-            price,
-          });
+          return { ...(await scrapeWithBrowser(target, browserOpts)), mode: "auto" };
         } catch (browserErr) {
           throw strict ? browserErr : err;
         }
       }
       throw err;
     }
+    fast.mode = "auto";
+
+    const fastFailed = fast.status >= 400 || fast.blocked;
+    if (fastFailed && playwrightReady) {
+      try {
+        return { ...(await scrapeWithBrowser(target, browserOpts)), mode: "auto" };
+      } catch (browserErr) {
+        // Browser also failed. Honor strict; otherwise hand back the fast attempt.
+        if (strict) throw browserErr;
+        return fast;
+      }
+    }
+    if (strict && fast.status >= 400) throw new WebkitError(`HTTP ${fast.status} for ${target}`);
+    return fast;
   }
 
   // Plain fast mode.
@@ -133,6 +130,50 @@ async function hasPlaywright(): Promise<boolean> {
   return playwrightAvailable;
 }
 
+/**
+ * Parse `html` once and run every extractor against it. Price runs first
+ * because main-content extraction prunes the DOM.
+ */
+function extractAll(
+  html: string,
+  url: string,
+  wantPrice: boolean,
+): { page: PageData; price: PriceInfo | null } {
+  return withDoc(html, (doc) => {
+    const price = wantPrice ? extractPrice(doc) : null;
+    const page = extractPageFromDoc(doc, url);
+    return { page, price };
+  });
+}
+
+function emptyPage(url: string, status: number, contentType: string, text: string): PageData {
+  return {
+    url,
+    status,
+    contentType,
+    metadata: {
+      title: "",
+      description: null,
+      canonical: null,
+      favicon: null,
+      meta: {},
+      og: {},
+      twitter: {},
+      language: null,
+      charset: null,
+    },
+    links: [],
+    images: [],
+    content: {
+      text,
+      html: text,
+      contentRootTag: null,
+      charCount: text.length,
+      readingTimeSec: Math.ceil((text.split(/\s+/).filter(Boolean).length / 200) * 60),
+    },
+  };
+}
+
 async function scrapeFast(
   url: string,
   opts: {
@@ -150,16 +191,11 @@ async function scrapeFast(
     signal: opts.signal,
   });
 
-  const elapsed = Date.now() - started;
   const contentType = res.contentType.toLowerCase();
   const isHtml =
     contentType.includes("text/html") ||
-    contentType === "" ||
-    res.text.trimStart().startsWith("<");
-
-  // Bot-block heuristic (fast mode): a 4xx/5xx status with a tiny body is
-  // almost always a bot wall / error page, not real content.
-  const blocked = res.status >= 400 && res.text.length < 5000;
+    contentType.includes("application/xhtml") ||
+    (contentType === "" && res.text.trimStart().startsWith("<"));
 
   // Strict mode throws on any 4xx/5xx (callers can pass strict:false to get
   // partial data back instead).
@@ -167,41 +203,25 @@ async function scrapeFast(
     throw new WebkitError(`HTTP ${res.status} for ${url}`);
   }
 
+  // Bot-block heuristics (fast mode):
+  //  - a 4xx/5xx status with a tiny body is almost always a bot wall / error page
+  //  - a challenge interstitial can also arrive with a 200, so run the detector too
+  const challenge = isHtml ? detectChallenge(res.text) : null;
+  const blocked = challenge !== null || (res.status >= 400 && res.text.length < 5000);
+
   if (!isHtml) {
     return {
-      url: res.url,
-      status: res.status,
-      contentType: res.contentType,
+      ...emptyPage(res.url, res.status, res.contentType, res.text),
       mode: "fast",
       effectiveMode: "fast",
-      durationMs: elapsed,
+      durationMs: Date.now() - started,
       retries: res.retries,
       blocked,
-      challenge: null,
-      metadata: {
-        title: "",
-        description: null,
-        canonical: null,
-        favicon: null,
-        meta: {},
-        og: {},
-        twitter: {},
-        language: null,
-        charset: null,
-      },
-      links: [],
-      images: [],
-      content: {
-        text: res.text,
-        html: res.text,
-        contentRootTag: null,
-        charCount: res.text.length,
-        readingTimeSec: Math.ceil(res.text.split(/\s+/).filter(Boolean).length / 200 * 60),
-      },
+      challenge,
     };
   }
 
-  const page = extractPage(res.text, res.url);
+  const { page, price } = extractAll(res.text, res.url, opts.price === true && !blocked);
   const out: ScrapeResult = {
     ...page,
     url: res.url,
@@ -212,12 +232,9 @@ async function scrapeFast(
     durationMs: Date.now() - started,
     retries: res.retries,
     blocked,
-    challenge: null,
+    challenge,
   };
-  if (opts.price && !blocked) {
-    const p = extractPrice(parseHtml(res.text));
-    if (p) out.price = p;
-  }
+  if (price) out.price = price;
   return out;
 }
 
@@ -235,27 +252,33 @@ async function scrapeWithBrowser(
   const started = Date.now();
   const browser = await chromium.launch({ headless: true });
   try {
-    const ctx = await browser.newContext({
-      userAgent:
-        opts.userAgent ||
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    });
+    const ctx = await browser.newContext({ userAgent: opts.userAgent || DEFAULT_USER_AGENT });
     const page = await ctx.newPage();
     const waitMs = opts.waitUntilMs ?? 8000;
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: waitMs + 15000 });
+    const response = await page.goto(url, {
+      waitUntil: "domcontentloaded",
+      timeout: waitMs + 15000,
+    });
     // Give JS (and any bot-challenge) time to render.
     await page.waitForTimeout(waitMs);
     const html = await page.content();
     const finalUrl = page.url();
+    const status = response?.status() ?? 200;
 
     // Detect a bot-challenge wall before we trust the DOM.
     const challenge = detectChallenge(html);
     const blocked = challenge !== null;
 
-    const data = extractPage(html, finalUrl);
+    if (opts.strict !== false && status >= 400 && !blocked) {
+      throw new WebkitError(`HTTP ${status} for ${url}`);
+    }
+
+    // Don't report a price from a challenge page — the DOM is the wall, not the product.
+    const { page: data, price } = extractAll(html, finalUrl, opts.price === true && !blocked);
     const out: ScrapeResult = {
       ...data,
       url: finalUrl,
+      status,
       mode: "browser",
       effectiveMode: "browser",
       durationMs: Date.now() - started,
@@ -263,11 +286,7 @@ async function scrapeWithBrowser(
       blocked,
       challenge,
     };
-    // Don't report a price from a challenge page — the DOM is the wall, not the product.
-    if (opts.price && !blocked) {
-      const p = extractPrice(parseHtml(html));
-      if (p) out.price = p;
-    }
+    if (price) out.price = price;
     return out;
   } finally {
     await browser.close();
@@ -275,10 +294,10 @@ async function scrapeWithBrowser(
 }
 
 /**
- * Detect a bot-challenge wall in rendered HTML. Returns a short human reason,
+ * Detect a bot-challenge wall in HTML. Returns a short human reason,
  * or null when the page looks like real content.
  */
-function detectChallenge(html: string): string | null {
+export function detectChallenge(html: string): string | null {
   const lower = html.slice(0, 40000).toLowerCase();
   const titleMatch = html.match(/<title[^>]*>([^<]*)<\/title>/i);
   const title = (titleMatch?.[1] || "").trim();
