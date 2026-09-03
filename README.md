@@ -108,9 +108,14 @@ tests/
   data; `strict: true` (default) throws. Use `--mode browser` or `--mode auto`
   for JS-heavy/bot-gated pages. Both modes set `blocked` / `challenge` when a
   Cloudflare-style interstitial is detected instead of real content.
-- **DuckDuckGo 202:** after a burst of queries DDG serves a captcha page with
-  HTTP 202 instead of results. The cascade falls through to Bing automatically;
-  with `--engine ddg` forced you get a clear error instead. Back off for a while.
+- **DuckDuckGo 202 — rate limit yourself:** after a burst of queries DDG serves
+  a captcha page with HTTP 202 instead of results, and keeps doing so for a
+  while for your IP. The cascade falls through to Bing automatically; with
+  `--engine ddg` forced you get a clear error instead. webkit does **not**
+  throttle searches for you, so if you call `search()`/`top()` in a loop, add
+  your own delay (a few seconds between queries is usually enough) and cache
+  results you've already seen. If you're already blocked, stop querying and it
+  clears on its own after a cooldown.
 - **Untrusted HTML:** pages are parsed with script evaluation and external
   resource loading disabled (`core/dom.ts`). Scraped JavaScript never runs.
 - **Price extraction is USD-only** for now: it recognises `$` amounts and
@@ -123,9 +128,11 @@ tests/
 browser-like User-Agent and parsing them. This is not an official API: it may
 break whenever their markup changes, and automated querying is against both
 engines' terms of service. `scrape` does not (yet) honor `robots.txt` or apply
-per-host rate limits beyond `top()`'s small concurrency cap. Use it for
-personal/research workloads at low volume, respect site owners, and don't point
-it at sites that prohibit scraping.
+per-host rate limits beyond `top()`'s small concurrency cap. **Rate limit
+yourself:** space out searches (seconds, not milliseconds), keep scrape
+concurrency low, and cache what you fetch — both engines will captcha or block
+your IP if you hammer them. Use it for personal/research workloads at low
+volume, respect site owners, and don't point it at sites that prohibit scraping.
 
 ## License
 
